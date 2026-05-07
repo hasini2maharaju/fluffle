@@ -316,11 +316,9 @@ OUTPUT FORMAT:
       {step === 3 && (
         <div ref={ref} className="fadeUp">
           {loading ? (
-            <div style={{ ...card, padding: "56px 32px", textAlign: "center" }}>
-              <div style={{ fontSize: 48, animation: "spin 1.5s linear infinite", display: "inline-block" }}>🧶</div>
-              <h3 style={{ margin: "16px 0 6px", color: C.cherry, fontFamily: DISPLAY, fontSize: 26 }}>Rewriting your pattern…</h3>
-              <p style={{ margin: 0, color: C.choco, fontSize: 14, fontFamily: BODY }}>Translating every row for your yarn — hold tight!</p>
-              <Dots />
+            <div style={{ ...card, padding: "28px 30px" }}>
+              <CardHeader bg={C.cherry} text="✨ Rewriting your pattern…" />
+              <PatternSkeleton />
             </div>
           ) : result ? (
             <>
@@ -350,363 +348,16 @@ OUTPUT FORMAT:
   );
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// YARN SCANNER — no external libraries, works on iPhone natively
-// ══════════════════════════════════════════════════════════════════════════════
-function YarnScanner() {
-  const [imgUrl,  setImgUrl]  = useState(null);
-  const [imgFile, setImgFile] = useState(null);
-  const [imgName, setImgName] = useState("");
-  const [notes,   setNotes]   = useState("");
-  const [phase,   setPhase]   = useState("upload");
-  const [converting, setConverting] = useState(false);
-  const [yarnInfo,  setYarnInfo]  = useState(null);
-  const [projects,  setProjects]  = useState([]);
-  const [patterns,  setPatterns]  = useState(null);
-  const [chosen,    setChosen]    = useState(null);
-  const [error,     setError]     = useState("");
-  const [drag,      setDrag]      = useState(false);
-  const fRef = useRef(null);
-  const rRef = useRef(null);
-
-  // Convert any image file to base64 JPEG safe for the Anthropic API.
-  // Strategy:
-  //   1. Try canvas.toBlob — works for jpg/png/webp/gif everywhere,
-  //      and for HEIC on iOS (iOS decodes HEIC at OS level) and macOS Safari.
-  //   2. If canvas fails (HEIC on desktop Chrome) → reject with helpful message.
-  const toJpegBase64 = (file) => new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      try {
-        const MAX = 1200;
-        let w = img.naturalWidth  || 800;
-        let h = img.naturalHeight || 600;
-        if (w > MAX || h > MAX) {
-          if (w > h) { h = Math.round(h * MAX / w); w = MAX; }
-          else       { w = Math.round(w * MAX / h); h = MAX; }
-        }
-        const canvas = document.createElement("canvas");
-        canvas.width = w; canvas.height = h;
-        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
-        URL.revokeObjectURL(url);
-        canvas.toBlob((blob) => {
-          if (!blob) { reject(new Error("Canvas returned empty blob")); return; }
-          const reader = new FileReader();
-          reader.onload = (e) => {
-            const data = e.target.result;
-            if (!data || !data.includes(",")) { reject(new Error("Could not read converted image")); return; }
-            resolve({ base64: data.split(",")[1], mediaType: "image/jpeg" });
-          };
-          reader.onerror = () => reject(new Error("Could not read converted image"));
-          reader.readAsDataURL(blob);
-        }, "image/jpeg", 0.85);
-      } catch (e) { URL.revokeObjectURL(url); reject(e); }
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      const n = file.name.toLowerCase();
-      const isHeic = file.type === "image/heic" || file.type === "image/heif"
-        || n.endsWith(".heic") || n.endsWith(".heif");
-      if (isHeic) {
-        reject(new Error(
-          "HEIC_DESKTOP: Your browser cannot process HEIC files. " +
-          "Please open the photo on your iPhone, tap Share → Save to Files, " +
-          "then upload that file — or take a screenshot instead (screenshots are always JPG)."
-        ));
-      } else {
-        reject(new Error("Could not decode this image. Please try a JPG or PNG."));
-      }
-    };
-    img.src = url;
-  });
-
-  const handleFile = async (f) => {
-    if (!f) return;
-    setError(""); setConverting(false);
-    const n = f.name.toLowerCase();
-    const ok = f.type.startsWith("image/")
-      || n.endsWith(".heic") || n.endsWith(".heif")
-      || n.endsWith(".jpg")  || n.endsWith(".jpeg")
-      || n.endsWith(".png")  || n.endsWith(".webp");
-    if (!ok) { setError("Please upload a photo — jpg, png, webp, or heic."); return; }
-
-    // Show preview immediately
-    setImgUrl(URL.createObjectURL(f));
-    setImgName(f.name);
-    setYarnInfo(null); setProjects([]); setPatterns(null);
-    setChosen(null); setPhase("upload"); setConverting(true);
-
-    // Convert to JPEG in background
-    try {
-      const { base64, mediaType } = await toJpegBase64(f);
-      // Store a Blob so we can read it cleanly at scan time
-      const jpegBlob = await fetch("data:image/jpeg;base64," + base64).then(r => r.blob());
-      setImgFile(new File([jpegBlob], n.replace(/\.heic$/i, ".jpg").replace(/\.heif$/i, ".jpg"), { type: "image/jpeg" }));
-      setConverting(false);
-    } catch (e) {
-      setConverting(false);
-      if (e.message.startsWith("HEIC_DESKTOP")) {
-        setError(e.message.replace("HEIC_DESKTOP: ", ""));
-        setImgUrl(null); setImgName("");
-      } else {
-        // Still set file — scan will try again and show error if needed
-        setImgFile(f);
-      }
-    }
-  };
-
-  const scan = async () => {
-    if (!imgFile) { setError("Please upload a photo first!"); return; }
-    setError(""); setPhase("scanning");
-    setTimeout(() => rRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
-
-    // Read the (already-converted) file as base64
-    let base64, mediaType;
-    try {
-      const result = await new Promise((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const data = e.target.result;
-          if (!data || !data.includes(",")) { reject(new Error("Empty file")); return; }
-          resolve({ base64: data.split(",")[1], mediaType: imgFile.type || "image/jpeg" });
-        };
-        reader.onerror = () => reject(new Error("FileReader failed"));
-        reader.readAsDataURL(imgFile);
-      });
-      base64 = result.base64; mediaType = result.mediaType;
-    } catch (e) {
-      setError("Could not read your photo — please try again.");
-      setPhase("upload"); return;
-    }
-
-    const SYS = `You are a crochet yarn expert. Look at the yarn in this photo and respond with ONLY a JSON object — no other text, no markdown, no code fences.
-
-Return exactly this structure:
-{"colours":["colour1","colour2"],"weight":"Worsted","amount":"medium","amountLabel":"roughly half a skein, good for a small amigurumi or accessories","projects":[{"emoji":"🐢","title":"Crochet Turtle","why":"The earthy green suits a turtle body and shell perfectly","difficulty":"Beginner"},{"emoji":"🌿","title":"Succulent Plant","why":"Deep green yarn makes a lifelike plant","difficulty":"Beginner"},{"emoji":"🧤","title":"Fingerless Gloves","why":"Neutral tones make stylish everyday gloves","difficulty":"Intermediate"},{"emoji":"🎀","title":"Bow Keyring","why":"This colour makes a charming bow accessory","difficulty":"Beginner"}]}
-
-Rules:
-- colours: every distinct colour you can see
-- weight: Lace / Fingering / Sport / DK / Worsted / Aran / Bulky / Super Bulky
-- amount: tiny / small / medium / large / full
-- projects: exactly 4, matched to the colours and amount you actually see
-- mention actual colours in each "why"`;
-
-    try {
-      const raw = await askClaudeWithImage(SYS,
-        `Describe this yarn and suggest 4 projects. Reply with ONLY the JSON.${notes ? " Note: " + notes : ""}`,
-        base64, mediaType);
-      const cleaned = raw.replace(/\`\`\`json|\`\`\`/gi, "").trim();
-      const s = cleaned.indexOf("{"); const e2 = cleaned.lastIndexOf("}");
-      if (s === -1 || e2 === -1) throw new Error("No JSON in response");
-      const parsed = JSON.parse(cleaned.slice(s, e2 + 1));
-      if (!Array.isArray(parsed.colours) || !Array.isArray(parsed.projects)) throw new Error("Missing fields in response");
-      setYarnInfo({ colours: parsed.colours, weight: parsed.weight || "Unknown", amount: parsed.amount, amountLabel: parsed.amountLabel || "" });
-      setProjects(parsed.projects.slice(0, 4));
-      setPhase("suggestions");
-    } catch (e) {
-      console.error("Scan error:", e.message);
-      setError("Scan failed: " + e.message);
-      setPhase("upload");
-    }
-  };
-
-  const findPatterns = async (project) => {
-    setChosen(project); setPatterns(null); setPhase("fetching");
-    setTimeout(() => rRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
-    const colours = yarnInfo?.colours?.join(", ") || "mixed colours";
-    const SYS2 = `You are a crochet pattern expert. Find 3 free patterns for "${project.title}" using ${colours} ${yarnInfo?.weight || "worsted"} yarn. If exact colours aren't available, suggest similar patterns with a colour swap tip. Reply with ONLY this JSON — no other text:
-{"patterns":[{"title":"Pattern name","source":"Ravelry","difficulty":"Beginner","description":"One sentence about what you make","colourNote":"How ${colours} works with this pattern"}],"encouragement":"A warm 1-2 sentence note"}`;
-    try {
-      const raw = await askClaude(SYS2, `Find 3 free crochet patterns for: ${project.title}. User has ${colours} ${yarnInfo?.weight || ""} yarn.`);
-      const cleaned = raw.replace(/\`\`\`json|\`\`\`/gi, "").trim();
-      const s = cleaned.indexOf("{"); const e2 = cleaned.lastIndexOf("}");
-      if (s === -1 || e2 === -1) throw new Error("No JSON");
-      setPatterns(JSON.parse(cleaned.slice(s, e2 + 1)));
-      setPhase("patterns");
-    } catch (e) {
-      setError("Could not load patterns — please try again.");
-      setPhase("suggestions");
-    }
-  };
-
-  const reset = () => {
-    setImgUrl(null); setImgFile(null); setImgName("");
-    setPhase("upload"); setYarnInfo(null); setProjects([]);
-    setPatterns(null); setChosen(null); setError(""); setNotes(""); setConverting(false);
-  };
-
-  const bord = (col) => `2px solid ${col}`;
-  const shadow = (col) => `3px 3px 0 ${col}`;
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-      <div style={{ ...card, padding: "28px 30px" }}>
-        <CardHeader bg={C.royal} text="🪄 Leftover Yarn Scanner" />
-
-        <div onClick={() => !converting && fRef.current?.click()}
-          onDragOver={e => { e.preventDefault(); setDrag(true); }}
-          onDragLeave={() => setDrag(false)}
-          onDrop={e => { e.preventDefault(); setDrag(false); handleFile(e.dataTransfer.files[0]); }}
-          style={{ border: bord(drag ? C.royal : imgUrl ? C.royal : C.black), borderRadius: 18, cursor: converting ? "default" : "pointer", transition: "all 0.2s", overflow: "hidden", marginBottom: 16, background: drag ? C.royal+"18" : imgUrl ? C.royal+"0C" : gridBg(C.cream), padding: imgUrl || converting ? 0 : "44px 24px", textAlign: "center", boxShadow: shadow(drag ? C.royal : C.black) }}>
-          <input ref={fRef} type="file" accept="image/*" style={{ display: "none" }}
-            onChange={e => { if (e.target.files[0]) { handleFile(e.target.files[0]); e.target.value = ""; } }} />
-          {converting ? (
-            <div style={{ padding: "32px 24px" }}>
-              <div style={{ fontSize: 36, animation: "spin 1s linear infinite", display: "inline-block" }}>⚙️</div>
-              <p style={{ margin: "10px 0 0", fontFamily: DISPLAY, fontSize: 16, color: C.royal }}>Processing photo…</p>
-            </div>
-          ) : imgUrl ? (
-            <div>
-              <img src={imgUrl} alt="yarn" style={{ width: "100%", maxHeight: 280, objectFit: "cover", display: "block" }} />
-              <div style={{ padding: "10px 16px", background: C.royal+"22", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span>✅</span>
-                  <span style={{ fontFamily: BODY, fontSize: 13.5, color: C.choco, fontWeight: 700 }}>Photo ready!</span>
-                  <span style={{ fontFamily: BODY, fontSize: 12, color: "#888" }}>{imgName.slice(0, 28)}</span>
-                </div>
-                <button onClick={e => { e.stopPropagation(); fRef.current?.click(); }} style={{ ...btn(C.white), padding: "5px 12px", fontSize: 12 }}>📷 Change</button>
-              </div>
-            </div>
-          ) : (
-            <>
-              <div style={{ fontSize: 48, marginBottom: 10 }}>🧶</div>
-              <p style={{ margin: "0 0 6px", fontSize: 18, fontFamily: DISPLAY, color: C.choco }}>Drop your yarn photo here</p>
-              <p style={{ margin: 0, fontSize: 13.5, color: "#999", fontFamily: BODY }}>Click to browse — jpg, png, or any iPhone photo</p>
-            </>
-          )}
-        </div>
-
-        <div style={{ marginBottom: 16 }}>
-          <Lbl color={C.choco}>Anything extra I should know? — optional</Lbl>
-          <div style={{ marginTop: 6 }}><Txa value={notes} onChange={setNotes} rows={2} placeholder="e.g. It's acrylic worsted, roughly half a skein..." /></div>
-        </div>
-
-        {error && (
-          <div style={{ marginBottom: 14, padding: "12px 16px", background: C.cherry+"18", border: bord(C.cherry), borderRadius: 12, display: "flex", alignItems: "flex-start", gap: 10 }}>
-            <span style={{ flexShrink: 0, fontSize: 18 }}>⚠️</span>
-            <p style={{ margin: 0, color: C.cherry, fontSize: 13.5, fontFamily: BODY, flex: 1, lineHeight: 1.6 }}>{error}</p>
-            <button onClick={() => setError("")} style={{ ...btn(C.cherry, C.white), padding: "3px 10px", fontSize: 12, flexShrink: 0 }}>✕</button>
-          </div>
-        )}
-
-        <button onClick={scan} disabled={!imgFile || converting || phase === "scanning"}
-          style={{ ...btn(!imgFile || converting || phase === "scanning" ? "#ddd" : C.royal, !imgFile || converting || phase === "scanning" ? "#aaa" : C.white), width: "100%", padding: 16, fontSize: 17, boxShadow: imgFile && !converting && phase !== "scanning" ? `5px 5px 0 ${C.black}` : "none", cursor: imgFile && !converting && phase !== "scanning" ? "pointer" : "not-allowed" }}
-          onMouseEnter={e => { if (imgFile && !converting && phase !== "scanning") { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `7px 7px 0 ${C.black}`; }}}
-          onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = imgFile && !converting && phase !== "scanning" ? `5px 5px 0 ${C.black}` : "none"; }}>
-          {phase === "scanning" ? "Analysing your yarn…" : converting ? "Processing photo…" : !imgFile ? "Upload a photo to get started" : "🔍 What Can I Make With This?"}
-        </button>
-      </div>
-
-      {phase === "scanning" && (
-        <div ref={rRef} style={{ ...card, padding: "50px 32px", textAlign: "center" }} className="fadeUp">
-          <div style={{ fontSize: 48, animation: "spin 1.4s linear infinite", display: "inline-block" }}>🔍</div>
-          <h3 style={{ margin: "16px 0 6px", color: C.royal, fontFamily: DISPLAY, fontSize: 24 }}>Looking at your yarn…</h3>
-          <p style={{ margin: 0, color: "#666", fontSize: 14, fontFamily: BODY }}>Reading the colours and matching project ideas</p>
-          <Dots cols={[C.royal, C.caramel, C.cherry]} />
-        </div>
-      )}
-
-      {(phase === "suggestions" || phase === "fetching" || phase === "patterns") && yarnInfo && (
-        <div ref={rRef} className="fadeUp" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-          <div style={{ ...card, padding: "18px 24px", display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
-            {imgUrl && <img src={imgUrl} alt="yarn" style={{ height: 60, width: 80, objectFit: "cover", border: bord(C.black), borderRadius: 10 }} />}
-            <div style={{ flex: 1 }}>
-              <div style={{ marginBottom: 4 }}>{yarnInfo.colours?.map((col, i) => <span key={i} style={{ display: "inline-block", background: C.caramel+"88", border: bord(C.black), borderRadius: 50, padding: "2px 10px", fontSize: 13, fontFamily: BODY, marginRight: 5, marginBottom: 3 }}>{col}</span>)}</div>
-              <p style={{ margin: 0, fontSize: 13.5, color: "#555", fontFamily: BODY }}><strong>{yarnInfo.weight}</strong> · {yarnInfo.amountLabel}</p>
-            </div>
-            <button onClick={reset} style={{ ...btn(C.white), padding: "7px 14px", fontSize: 12 }}
-              onMouseEnter={e => { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `5px 5px 0 ${C.black}`; }}
-              onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = `4px 4px 0 ${C.black}`; }}>🔄 New scan</button>
-          </div>
-
-          <div style={{ ...card, padding: "28px 30px" }}>
-            <CardHeader bg={C.royal} text="✨ Here's what you could make!" />
-            <div className="two-col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
-              {projects.map((p, i) => (
-                <div key={i} style={{ padding: 18, borderRadius: 16, border: bord(chosen?.title === p.title ? C.royal : C.black), background: chosen?.title === p.title ? C.royal+"15" : gridBg(C.white), boxShadow: shadow(chosen?.title === p.title ? C.royal : C.black), transition: "all 0.15s" }}>
-                  <div style={{ fontSize: 32, marginBottom: 8 }}>{p.emoji}</div>
-                  <p style={{ margin: "0 0 4px", fontFamily: DISPLAY, fontSize: 16, color: C.choco }}>{p.title}</p>
-                  <p style={{ margin: "0 0 10px", fontSize: 13, color: "#555", lineHeight: 1.6, fontFamily: BODY }}>{p.why}</p>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: C.royal, fontFamily: BODY, letterSpacing: "0.8px", textTransform: "uppercase" }}>{p.difficulty}</span>
-                </div>
-              ))}
-            </div>
-            <div style={{ marginTop: 22, padding: "16px 20px", background: C.caramel+"66", border: bord(C.black), borderRadius: 16, textAlign: "center" }}>
-              <p style={{ margin: "0 0 14px", fontFamily: DISPLAY, fontSize: 17, color: C.choco }}>🧶 Would you like free patterns for any of these?</p>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center" }}>
-                {projects.map((p, i) => (
-                  <button key={i} onClick={() => findPatterns(p)} disabled={phase === "fetching"}
-                    style={{ ...btn(C.white), padding: "9px 18px", fontSize: 14, display: "flex", alignItems: "center", gap: 6 }}
-                    onMouseEnter={e => { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `5px 5px 0 ${C.black}`; }}
-                    onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = `4px 4px 0 ${C.black}`; }}>
-                    {p.emoji} {p.title.split(" ").slice(0, 3).join(" ")}…
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          {phase === "fetching" && (
-            <div style={{ ...card, padding: "44px 32px", textAlign: "center" }} className="fadeUp">
-              <div style={{ fontSize: 44, animation: "spin 1.4s linear infinite", display: "inline-block" }}>🔗</div>
-              <h3 style={{ margin: "14px 0 6px", color: C.royal, fontFamily: DISPLAY, fontSize: 22 }}>Finding free patterns for {chosen?.title}…</h3>
-              <p style={{ margin: 0, color: "#666", fontSize: 14, fontFamily: BODY }}>Searching Ravelry, YouTube, AllFreeCrochet and more</p>
-            </div>
-          )}
-
-          {phase === "patterns" && patterns && (
-            <div style={{ ...card, padding: "28px 30px" }} className="fadeUp">
-              <CardHeader bg={C.choco} text={`${chosen?.emoji} Free Patterns — ${chosen?.title}`} fg={C.caramel} />
-              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-                {(patterns.patterns || []).map((pat, i) => (
-                  <div key={i} style={{ borderRadius: 16, border: bord(C.black), overflow: "hidden", boxShadow: shadow(C.black) }}>
-                    <div style={{ background: i % 2 === 0 ? C.choco : C.cherry, padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-                      <span style={{ fontFamily: DISPLAY, fontSize: 16, color: C.caramel }}>{pat.title}</span>
-                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                        <span style={{ background: C.caramel, color: C.black, padding: "2px 10px", borderRadius: 50, fontSize: 11, fontWeight: 700, fontFamily: BODY, border: bord(C.black) }}>{pat.difficulty}</span>
-                        <span style={{ background: "rgba(255,255,255,0.15)", color: C.white, padding: "2px 10px", borderRadius: 50, fontSize: 11, fontFamily: BODY }}>📍 {pat.source}</span>
-                      </div>
-                    </div>
-                    <div style={{ padding: "14px 16px", background: gridBg(C.white) }}>
-                      <p style={{ margin: "0 0 10px", fontSize: 14, color: C.black, lineHeight: 1.65, fontFamily: BODY }}>{pat.description}</p>
-                      <div style={{ padding: "9px 14px", background: C.caramel+"55", borderRadius: 10, border: bord(C.black), marginBottom: 12 }}>
-                        <p style={{ margin: 0, fontSize: 13, color: C.choco, fontFamily: BODY, lineHeight: 1.6 }}>🎨 <strong>Colour tip:</strong> {pat.colourNote}</p>
-                      </div>
-                      <a href={`https://www.google.com/search?q=${encodeURIComponent("free crochet " + pat.title + " pattern")}`}
-                        target="_blank" rel="noopener noreferrer"
-                        style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "9px 18px", borderRadius: 50, background: C.royal, color: C.white, border: bord(C.black), boxShadow: shadow(C.black), fontFamily: DISPLAY, fontSize: 14, textDecoration: "none", transition: "all 0.15s" }}
-                        onMouseEnter={e => { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `5px 5px 0 ${C.black}`; }}
-                        onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = shadow(C.black); }}>
-                        🔍 Find this pattern
-                      </a>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {patterns.encouragement && (
-                <div style={{ marginTop: 18, padding: "13px 18px", background: C.mauve+"44", border: bord(C.mauve), borderRadius: 14 }}>
-                  <p style={{ margin: 0, fontSize: 14.5, color: C.choco, fontFamily: BODY, lineHeight: 1.7 }}>🧶 {patterns.encouragement}</p>
-                </div>
-              )}
-              <button onClick={() => setPhase("suggestions")} style={{ ...btn(C.white), marginTop: 16, padding: "10px 22px", fontSize: 14 }}
-                onMouseEnter={e => { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `5px 5px 0 ${C.black}`; }}
-                onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = `4px 4px 0 ${C.black}`; }}>← Back to all suggestions</button>
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // HOME PAGE
 // ══════════════════════════════════════════════════════════════════════════════
 function HomePage({ goTo }) {
   const features = [
-    { emoji: "✍️", title: "Pattern Rewriter", color: C.cherry, bg: C.cherry + "15", desc: "Found a tutorial you love but your yarn is different? Paste the pattern, enter your gauge, and get the entire thing rewritten for your exact materials — every row, every stitch count.", cta: "Try Pattern Rewriter", page: "rewriter" },
-    { emoji: "🔍", title: "Yarn Scanner", color: C.royal, bg: C.royal + "15", desc: "Got leftover yarn with nowhere to go? Upload a photo and Fluffle will scan the colours, estimate how much you have, and suggest projects perfectly matched to what you've got.", cta: "Try Yarn Scanner", page: "scanner" },
+    { emoji: "✍️", title: "Pattern Rewriter",  color: C.cherry,  desc: "Paste any pattern, enter your gauge — get the entire thing rewritten for your yarn. Every row, every stitch count.", cta: "Try it →", page: "rewriter" },
+    { emoji: "🔍", title: "Yarn Scanner",       color: C.royal,   desc: "Upload a photo of your leftover yarn and get 4 project ideas matched exactly to your colours and how much you have.", cta: "Try it →", page: "scanner"  },
+    { emoji: "🖼️", title: "Pixel Art",          color: C.mauve,   desc: "Convert any photo into a clean flat-colour pixel grid — choose how chunky, how many colours, then export or send to Pixel Grid.", cta: "Try it →", page: "pixelart" },
+    { emoji: "🧩", title: "Pixel Grid",         color: C.caramel, textColor: C.choco, desc: "Upload a pixel grid image and get serpentine numbers overlaid on every cell automatically. Export as PNG.", cta: "Try it →", page: "pixel" },
   ];
   const howItWorks = [
     { n: "01", title: "Paste or Upload", desc: "Drop in your crochet pattern as text, or upload a photo of your leftover yarn — even HEIC from your iPhone works." },
@@ -739,34 +390,31 @@ function HomePage({ goTo }) {
             <button onClick={() => goTo("rewriter")} style={{ ...btn(C.caramel), padding: "16px 32px", fontSize: 18 }}
               onMouseEnter={e => { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `6px 6px 0 ${C.black}`; }}
               onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = `4px 4px 0 ${C.black}`; }}>✍️ Rewrite a Pattern</button>
-            <button onClick={() => goTo("scanner")} style={{ ...btn(C.royal, C.white), padding: "16px 32px", fontSize: 18 }}
-              onMouseEnter={e => { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `6px 6px 0 ${C.black}`; }}
-              onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = `4px 4px 0 ${C.black}`; }}>🔍 Scan My Yarn</button>
           </div>
         </div>
       </section>
 
       {/* ── TOOLS ── */}
       <section style={{ padding: "72px 24px", background: `radial-gradient(ellipse at 30% 0%, ${C.cherry}12,transparent 50%), radial-gradient(ellipse at 80% 100%, ${C.royal}10,transparent 50%), #FFF0E0` }}>
-        <div style={{ maxWidth: 860, margin: "0 auto" }}>
+        <div style={{ maxWidth: 900, margin: "0 auto" }}>
           <div style={{ textAlign: "center", marginBottom: 48 }}>
-            <h2 style={{ margin: "0 0 12px", fontFamily: DISPLAY, fontSize: "clamp(30px,5vw,46px)", color: C.choco }}>Two tools. Zero stress.</h2>
+            <h2 style={{ margin: "0 0 12px", fontFamily: DISPLAY, fontSize: "clamp(30px,5vw,46px)", color: C.choco }}>Four tools. Zero stress.</h2>
             <p style={{ margin: 0, fontSize: 17, color: "#7A4A40", fontFamily: BODY }}>Built for real crocheters with real yarn problems</p>
           </div>
-          <div className="two-col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 24 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 24 }}>
             {features.map((f, i) => (
               <div key={i} style={{ ...card, padding: 0, overflow: "hidden", transition: "transform 0.2s" }}
                 onMouseEnter={e => e.currentTarget.style.transform = "translateY(-4px)"}
                 onMouseLeave={e => e.currentTarget.style.transform = "none"}>
                 <div style={{ background: f.color, padding: "22px 24px" }}>
-                  <div style={{ fontSize: 40, marginBottom: 8 }}>{f.emoji}</div>
-                  <h3 style={{ margin: 0, fontFamily: DISPLAY, fontSize: 24, color: C.white }}>{f.title}</h3>
+                  <div style={{ fontSize: 36, marginBottom: 8 }}>{f.emoji}</div>
+                  <h3 style={{ margin: 0, fontFamily: DISPLAY, fontSize: 22, color: f.textColor || C.white }}>{f.title}</h3>
                 </div>
-                <div style={{ padding: "22px 24px", background: gridBg(C.white) }}>
-                  <p style={{ margin: "0 0 22px", fontSize: 15, color: "#4A2A20", lineHeight: 1.75, fontFamily: BODY }}>{f.desc}</p>
-                  <button onClick={() => goTo(f.page)} style={{ ...btn(f.color, C.white), padding: "11px 22px", fontSize: 15 }}
+                <div style={{ padding: "20px 24px", background: gridBg(C.white) }}>
+                  <p style={{ margin: "0 0 18px", fontSize: 14.5, color: "#4A2A20", lineHeight: 1.75, fontFamily: BODY }}>{f.desc}</p>
+                  <button onClick={() => goTo(f.page)} style={{ ...btn(f.color, f.textColor || C.white), padding: "10px 20px", fontSize: 14 }}
                     onMouseEnter={e => { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `6px 6px 0 ${C.black}`; }}
-                    onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = `4px 4px 0 ${C.black}`; }}>{f.cta} →</button>
+                    onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = `4px 4px 0 ${C.black}`; }}>{f.cta}</button>
                 </div>
               </div>
             ))}
@@ -783,8 +431,8 @@ function HomePage({ goTo }) {
           </div>
           <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
             {howItWorks.map((h, i) => (
-              <div key={i} style={{ display: "flex", gap: 22, alignItems: "flex-start" }}
-                className="fadeUp" style={{ animation: `fadeUp 0.4s ${i * 0.12}s both` }}>
+              <div key={i} style={{ display: "flex", gap: 22, alignItems: "flex-start", animation: `fadeUp 0.4s ${i * 0.12}s both` }}
+                className="fadeUp">
                 <div style={{ flexShrink: 0, width: 56, height: 56, borderRadius: 16, background: i === 0 ? C.cherry : i === 1 ? C.royal : C.mauve, border: `2.5px solid ${C.black}`, boxShadow: `3px 3px 0 ${C.black}`, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: DISPLAY, fontSize: 20, color: C.white }}>{h.n}</div>
                 <div style={{ paddingTop: 4 }}>
                   <h3 style={{ margin: "0 0 6px", fontFamily: DISPLAY, fontSize: 20, color: C.caramel }}>{h.title}</h3>
@@ -829,7 +477,7 @@ function AboutPage() {
         {[
           { title: "Where it started 🕷️", bg: C.cherry + "15", border: C.cherry, content: "Fluffle started with a Spider-Man beanie. I found a tutorial I loved, but my yarn was a completely different weight to the one in the video. I spent an entire day manually calculating every stitch count, every row, trying to make my version turn out the same size as hers. By the end I was exhausted — and I hadn't even started crocheting yet. There had to be a better way." },
           { title: "The idea 💡", bg: C.caramel + "55", border: C.caramel, content: "I realised this wasn't just my problem. Every crocheter has experienced it — you find a pattern you love, but your yarn is thicker, your tension is tighter, or you just want it a size bigger. The maths isn't hard, but it's tedious, and it gets in the way of the actual creative joy of making something. Fluffle does that maths for you, instantly." },
-          { title: "What Fluffle does 🧶", bg: C.royal + "15", border: C.royal, content: "The Pattern Rewriter takes any crochet pattern and completely rewrites it for your yarn and hook — every row, every stitch count, every design detail like amigurumi eyes or colourwork, all scaled to your exact gauge. The Yarn Scanner looks at a photo of your leftover yarn, figures out what colours and how much you have, and suggests projects perfectly matched to what's sitting in your stash." },
+          { title: "What Fluffle does 🧶", bg: C.royal + "15", border: C.royal, content: "The Pattern Rewriter takes any crochet pattern and completely rewrites it for your yarn and hook — every row, every stitch count, every design detail like amigurumi eyes or colourwork, all scaled to your exact gauge. The Pixel Grid Generator turns any image into a numbered crochet chart, with serpentine numbering ready to follow stitch by stitch." },
           { title: "Who it's for 🌸", bg: C.mauve + "33", border: C.mauve, content: "Fluffle is for anyone who crochets — total beginners who get confused when a pattern doesn't specify their yarn weight, intermediate makers who want to scale up a cute amigurumi pattern, or experienced crafters who want to finally use up that mystery ball of leftover yarn. If you've ever stared at a pattern wondering how to make it work with what you have, Fluffle is for you." },
         ].map((s, i) => (
           <div key={i} style={{ padding: "22px 26px", background: s.bg, border: `2px solid ${s.border}`, borderRadius: 20, boxShadow: `4px 4px 0 ${s.border}` }}>
@@ -897,31 +545,1053 @@ function ContactPage() {
 // ══════════════════════════════════════════════════════════════════════════════
 // TOOLS PAGE WRAPPER
 // ══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+// YARN SCANNER
+// ══════════════════════════════════════════════════════════════════════════════
+function YarnScanner() {
+  const [imgUrl,  setImgUrl]  = useState(null);
+  const [imgFile, setImgFile] = useState(null);
+  const [imgName, setImgName] = useState("");
+  const [notes,   setNotes]   = useState("");
+  const [phase,   setPhase]   = useState("upload");
+  const [converting, setConverting] = useState(false);
+  const [yarnInfo,  setYarnInfo]  = useState(null);
+  const [projects,  setProjects]  = useState([]);
+  const [patterns,  setPatterns]  = useState(null);
+  const [chosen,    setChosen]    = useState(null);
+  const [error,     setError]     = useState("");
+  const [drag,      setDrag]      = useState(false);
+  const fRef = useRef(null);
+  const rRef = useRef(null);
+
+  const toJpegBase64 = (file) => new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const MAX = 1200;
+        let w = img.naturalWidth || 800, h = img.naturalHeight || 600;
+        if (w > MAX || h > MAX) { if (w > h) { h = Math.round(h * MAX / w); w = MAX; } else { w = Math.round(w * MAX / h); h = MAX; } }
+        const canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        canvas.toBlob((blob) => {
+          if (!blob) { reject(new Error("Canvas returned empty blob")); return; }
+          const reader = new FileReader();
+          reader.onload = (e) => { const data = e.target.result; if (!data?.includes(",")) { reject(new Error("Could not read")); return; } resolve({ base64: data.split(",")[1], mediaType: "image/jpeg" }); };
+          reader.onerror = () => reject(new Error("Could not read converted image"));
+          reader.readAsDataURL(blob);
+        }, "image/jpeg", 0.85);
+      } catch (e) { URL.revokeObjectURL(url); reject(e); }
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Could not decode this image. Please try a JPG or PNG.")); };
+    img.src = url;
+  });
+
+  const handleFile = async (f) => {
+    if (!f) return;
+    setError(""); setConverting(false);
+    const n = f.name.toLowerCase();
+    if (!f.type.startsWith("image/") && !n.endsWith(".jpg") && !n.endsWith(".jpeg") && !n.endsWith(".png") && !n.endsWith(".webp")) { setError("Please upload a photo — jpg, png, or webp."); return; }
+    setImgUrl(URL.createObjectURL(f)); setImgName(f.name);
+    setYarnInfo(null); setProjects([]); setPatterns(null); setChosen(null); setPhase("upload"); setConverting(true);
+    try {
+      const { base64, mediaType } = await toJpegBase64(f);
+      const jpegBlob = await fetch("data:image/jpeg;base64," + base64).then(r => r.blob());
+      setImgFile(new File([jpegBlob], n.replace(/\.heic$/i, ".jpg"), { type: "image/jpeg" }));
+      setConverting(false);
+    } catch (e) { setConverting(false); setImgFile(f); }
+  };
+
+  const scan = async () => {
+    if (!imgFile) { setError("Please upload a photo first!"); return; }
+    setError(""); setPhase("scanning");
+    setTimeout(() => rRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+    let base64, mediaType;
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = (e) => { const data = e.target.result; if (!data?.includes(",")) { reject(new Error("Empty file")); return; } resolve({ base64: data.split(",")[1], mediaType: imgFile.type || "image/jpeg" }); };
+        reader.onerror = () => reject(new Error("FileReader failed"));
+        reader.readAsDataURL(imgFile);
+      });
+      base64 = result.base64; mediaType = result.mediaType;
+    } catch (e) { setError("Could not read your photo — please try again."); setPhase("upload"); return; }
+
+    const SYS = `You are a crochet yarn expert. Look at the yarn in this photo and respond with ONLY a JSON object — no other text, no markdown, no code fences.
+Return exactly this structure:
+{"colours":["colour1","colour2"],"weight":"Worsted","amount":"medium","amountLabel":"roughly half a skein, good for a small amigurumi or accessories","projects":[{"emoji":"🐢","title":"Crochet Turtle","why":"The earthy green suits a turtle body perfectly","difficulty":"Beginner"},{"emoji":"🌿","title":"Succulent Plant","why":"Deep green yarn makes a lifelike plant","difficulty":"Beginner"},{"emoji":"🧤","title":"Fingerless Gloves","why":"Neutral tones make stylish everyday gloves","difficulty":"Intermediate"},{"emoji":"🎀","title":"Bow Keyring","why":"This colour makes a charming bow accessory","difficulty":"Beginner"}]}`;
+    try {
+      const raw = await askClaudeWithImage(SYS, `Describe this yarn and suggest 4 projects. Reply with ONLY the JSON.${notes ? " Note: " + notes : ""}`, base64, mediaType);
+      const cleaned = raw.replace(/```json|```/gi, "").trim();
+      const s = cleaned.indexOf("{"); const e2 = cleaned.lastIndexOf("}");
+      if (s === -1 || e2 === -1) throw new Error("No JSON in response");
+      const parsed = JSON.parse(cleaned.slice(s, e2 + 1));
+      if (!Array.isArray(parsed.colours) || !Array.isArray(parsed.projects)) throw new Error("Missing fields");
+      setYarnInfo({ colours: parsed.colours, weight: parsed.weight || "Unknown", amount: parsed.amount, amountLabel: parsed.amountLabel || "" });
+      setProjects(parsed.projects.slice(0, 4));
+      setPhase("suggestions");
+    } catch (e) { setError("Scan failed — please try again!"); setPhase("upload"); }
+  };
+
+  const findPatterns = async (project) => {
+    setChosen(project); setPatterns(null); setPhase("fetching");
+    setTimeout(() => rRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }), 100);
+    const colours = yarnInfo?.colours?.join(", ") || "mixed colours";
+    const SYS2 = `You are a crochet pattern expert. Find 3 free patterns for "${project.title}" using ${colours} ${yarnInfo?.weight || "worsted"} yarn. Reply with ONLY this JSON — no other text:
+{"patterns":[{"title":"Pattern name","source":"Ravelry","difficulty":"Beginner","description":"One sentence about what you make","colourNote":"How ${colours} works with this pattern"}],"encouragement":"A warm 1-2 sentence note"}`;
+    try {
+      const raw = await askClaude(SYS2, `Find 3 free crochet patterns for: ${project.title}. User has ${colours} ${yarnInfo?.weight || ""} yarn.`);
+      const cleaned = raw.replace(/```json|```/gi, "").trim();
+      const s = cleaned.indexOf("{"); const e2 = cleaned.lastIndexOf("}");
+      if (s === -1 || e2 === -1) throw new Error("No JSON");
+      setPatterns(JSON.parse(cleaned.slice(s, e2 + 1)));
+      setPhase("patterns");
+    } catch (e) { setError("Could not load patterns — please try again."); setPhase("suggestions"); }
+  };
+
+  const reset = () => { setImgUrl(null); setImgFile(null); setImgName(""); setPhase("upload"); setYarnInfo(null); setProjects([]); setPatterns(null); setChosen(null); setError(""); setNotes(""); setConverting(false); };
+  const bord = (col) => `2px solid ${col}`;
+  const shadow = (col) => `3px 3px 0 ${col}`;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div style={{ ...card, padding: "28px 30px" }}>
+        <CardHeader bg={C.royal} text="🪄 Leftover Yarn Scanner" />
+        <div onClick={() => !converting && fRef.current?.click()}
+          onDragOver={e => { e.preventDefault(); setDrag(true); }} onDragLeave={() => setDrag(false)}
+          onDrop={e => { e.preventDefault(); setDrag(false); handleFile(e.dataTransfer.files[0]); }}
+          style={{ border: bord(drag ? C.royal : imgUrl ? C.royal : C.black), borderRadius: 18, cursor: converting ? "default" : "pointer", transition: "all 0.2s", overflow: "hidden", marginBottom: 16, background: drag ? C.royal+"18" : imgUrl ? C.royal+"0C" : gridBg(C.cream), padding: imgUrl || converting ? 0 : "44px 24px", textAlign: "center", boxShadow: shadow(drag ? C.royal : C.black) }}>
+          <input ref={fRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) { handleFile(e.target.files[0]); e.target.value = ""; } }} />
+          {converting ? (
+            <div style={{ padding: "32px 24px" }}><div style={{ fontSize: 36, animation: "spin 1s linear infinite", display: "inline-block" }}>⚙️</div><p style={{ margin: "10px 0 0", fontFamily: DISPLAY, fontSize: 16, color: C.royal }}>Processing photo…</p></div>
+          ) : imgUrl ? (
+            <div>
+              <img src={imgUrl} alt="yarn" style={{ width: "100%", maxHeight: 280, objectFit: "cover", display: "block" }} />
+              <div style={{ padding: "10px 16px", background: C.royal+"22", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                <span style={{ fontFamily: BODY, fontSize: 13.5, color: C.choco, fontWeight: 700 }}>✅ {imgName.slice(0, 28)}</span>
+                <button onClick={e => { e.stopPropagation(); fRef.current?.click(); }} style={{ ...btn(C.white), padding: "5px 12px", fontSize: 12 }}>📷 Change</button>
+              </div>
+            </div>
+          ) : (
+            <><div style={{ fontSize: 48, marginBottom: 10 }}>🧶</div><p style={{ margin: "0 0 6px", fontSize: 18, fontFamily: DISPLAY, color: C.choco }}>Drop your yarn photo here</p><p style={{ margin: 0, fontSize: 13.5, color: "#999", fontFamily: BODY }}>Click to browse — jpg, png, or webp</p></>
+          )}
+        </div>
+        <div style={{ marginBottom: 16 }}><Lbl color={C.choco}>Anything extra I should know? — optional</Lbl><div style={{ marginTop: 6 }}><Txa value={notes} onChange={setNotes} rows={2} placeholder="e.g. It's acrylic worsted, roughly half a skein..." /></div></div>
+        {error && <div style={{ marginBottom: 14, padding: "12px 16px", background: C.cherry+"18", border: bord(C.cherry), borderRadius: 12, display: "flex", alignItems: "flex-start", gap: 10 }}><span style={{ flexShrink: 0, fontSize: 18 }}>⚠️</span><p style={{ margin: 0, color: C.cherry, fontSize: 13.5, fontFamily: BODY, flex: 1, lineHeight: 1.6 }}>{error}</p><button onClick={() => setError("")} style={{ ...btn(C.cherry, C.white), padding: "3px 10px", fontSize: 12, flexShrink: 0 }}>✕</button></div>}
+        <button onClick={scan} disabled={!imgFile || converting || phase === "scanning"}
+          style={{ ...btn(!imgFile || converting || phase === "scanning" ? "#ddd" : C.royal, !imgFile || converting || phase === "scanning" ? "#aaa" : C.white), width: "100%", padding: 16, fontSize: 17, cursor: imgFile && !converting && phase !== "scanning" ? "pointer" : "not-allowed" }}>
+          {phase === "scanning" ? "Analysing your yarn…" : converting ? "Processing…" : !imgFile ? "Upload a photo to get started" : "🔍 What Can I Make With This?"}
+        </button>
+      </div>
+
+      {phase === "scanning" && (
+        <div ref={rRef} style={{ ...card, padding: "50px 32px", textAlign: "center" }} className="fadeUp">
+          <div style={{ fontSize: 48, animation: "spin 1.4s linear infinite", display: "inline-block" }}>🔍</div>
+          <h3 style={{ margin: "16px 0 6px", color: C.royal, fontFamily: DISPLAY, fontSize: 24 }}>Looking at your yarn…</h3>
+          <p style={{ margin: 0, color: "#666", fontSize: 14, fontFamily: BODY }}>Reading the colours and matching project ideas</p>
+          <Dots cols={[C.royal, C.caramel, C.cherry]} />
+        </div>
+      )}
+
+      {(phase === "suggestions" || phase === "fetching" || phase === "patterns") && yarnInfo && (
+        <div ref={rRef} className="fadeUp" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+          <div style={{ ...card, padding: "18px 24px", display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap" }}>
+            {imgUrl && <img src={imgUrl} alt="yarn" style={{ height: 60, width: 80, objectFit: "cover", border: bord(C.black), borderRadius: 10 }} />}
+            <div style={{ flex: 1 }}>
+              <div style={{ marginBottom: 4 }}>{yarnInfo.colours?.map((col, i) => <span key={i} style={{ display: "inline-block", background: C.caramel+"88", border: bord(C.black), borderRadius: 50, padding: "2px 10px", fontSize: 13, fontFamily: BODY, marginRight: 5, marginBottom: 3 }}>{col}</span>)}</div>
+              <p style={{ margin: 0, fontSize: 13.5, color: "#555", fontFamily: BODY }}><strong>{yarnInfo.weight}</strong> · {yarnInfo.amountLabel}</p>
+            </div>
+            <button onClick={reset} style={{ ...btn(C.white), padding: "7px 14px", fontSize: 12 }}>🔄 New scan</button>
+          </div>
+
+          <div style={{ ...card, padding: "28px 30px" }}>
+            <CardHeader bg={C.royal} text="✨ Here's what you could make!" />
+            <div className="two-col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+              {projects.map((p, i) => (
+                <div key={i} style={{ padding: 18, borderRadius: 16, border: bord(chosen?.title === p.title ? C.royal : C.black), background: chosen?.title === p.title ? C.royal+"15" : gridBg(C.white), boxShadow: shadow(chosen?.title === p.title ? C.royal : C.black), transition: "all 0.15s" }}>
+                  <div style={{ fontSize: 32, marginBottom: 8 }}>{p.emoji}</div>
+                  <p style={{ margin: "0 0 4px", fontFamily: DISPLAY, fontSize: 16, color: C.choco }}>{p.title}</p>
+                  <p style={{ margin: "0 0 10px", fontSize: 13, color: "#555", lineHeight: 1.6, fontFamily: BODY }}>{p.why}</p>
+                  <span style={{ fontSize: 11, fontWeight: 700, color: C.royal, fontFamily: BODY, letterSpacing: "0.8px", textTransform: "uppercase" }}>{p.difficulty}</span>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 22, padding: "16px 20px", background: C.caramel+"66", border: bord(C.black), borderRadius: 16, textAlign: "center" }}>
+              <p style={{ margin: "0 0 14px", fontFamily: DISPLAY, fontSize: 17, color: C.choco }}>🧶 Would you like free patterns for any of these?</p>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, justifyContent: "center" }}>
+                {projects.map((p, i) => (
+                  <button key={i} onClick={() => findPatterns(p)} disabled={phase === "fetching"}
+                    style={{ ...btn(C.white), padding: "9px 18px", fontSize: 14 }}>
+                    {p.emoji} {p.title.split(" ").slice(0, 3).join(" ")}…
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {phase === "fetching" && (
+            <div style={{ ...card, padding: "44px 32px", textAlign: "center" }} className="fadeUp">
+              <div style={{ fontSize: 44, animation: "spin 1.4s linear infinite", display: "inline-block" }}>🔗</div>
+              <h3 style={{ margin: "14px 0 6px", color: C.royal, fontFamily: DISPLAY, fontSize: 22 }}>Finding free patterns…</h3>
+              <Dots cols={[C.royal, C.caramel, C.cherry]} />
+            </div>
+          )}
+
+          {phase === "patterns" && patterns && (
+            <div style={{ ...card, padding: "28px 30px" }} className="fadeUp">
+              <CardHeader bg={C.choco} text={`${chosen?.emoji} Free Patterns — ${chosen?.title}`} fg={C.caramel} />
+              <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+                {(patterns.patterns || []).map((pat, i) => (
+                  <div key={i} style={{ borderRadius: 16, border: bord(C.black), overflow: "hidden", boxShadow: shadow(C.black) }}>
+                    <div style={{ background: i % 2 === 0 ? C.choco : C.cherry, padding: "10px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+                      <span style={{ fontFamily: DISPLAY, fontSize: 16, color: C.caramel }}>{pat.title}</span>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <span style={{ background: C.caramel, color: C.black, padding: "2px 10px", borderRadius: 50, fontSize: 11, fontWeight: 700, fontFamily: BODY, border: bord(C.black) }}>{pat.difficulty}</span>
+                        <span style={{ background: "rgba(255,255,255,0.15)", color: C.white, padding: "2px 10px", borderRadius: 50, fontSize: 11, fontFamily: BODY }}>📍 {pat.source}</span>
+                      </div>
+                    </div>
+                    <div style={{ padding: "14px 16px", background: gridBg(C.white) }}>
+                      <p style={{ margin: "0 0 10px", fontSize: 14, color: C.black, lineHeight: 1.65, fontFamily: BODY }}>{pat.description}</p>
+                      <div style={{ padding: "9px 14px", background: C.caramel+"55", borderRadius: 10, border: bord(C.black), marginBottom: 12 }}>
+                        <p style={{ margin: 0, fontSize: 13, color: C.choco, fontFamily: BODY, lineHeight: 1.6 }}>🎨 <strong>Colour tip:</strong> {pat.colourNote}</p>
+                      </div>
+                      <a href={`https://www.google.com/search?q=${encodeURIComponent("free crochet " + pat.title + " pattern")}`} target="_blank" rel="noopener noreferrer"
+                        style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "9px 18px", borderRadius: 50, background: C.royal, color: C.white, border: bord(C.black), boxShadow: shadow(C.black), fontFamily: DISPLAY, fontSize: 14, textDecoration: "none" }}>
+                        🔍 Find this pattern
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {patterns.encouragement && <div style={{ marginTop: 18, padding: "13px 18px", background: C.mauve+"44", border: bord(C.mauve), borderRadius: 14 }}><p style={{ margin: 0, fontSize: 14.5, color: C.choco, fontFamily: BODY, lineHeight: 1.7 }}>🧶 {patterns.encouragement}</p></div>}
+              <button onClick={() => setPhase("suggestions")} style={{ ...btn(C.white), marginTop: 16, padding: "10px 22px", fontSize: 14 }}>← Back to suggestions</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// SKELETON SCREEN — animated placeholder while AI generates
+// ══════════════════════════════════════════════════════════════════════════════
+function Skeleton({ width = "100%", height = 18, radius = 8, style = {} }) {
+  return (
+    <div style={{ width, height, borderRadius: radius, background: "linear-gradient(90deg,#e8d5c4 25%,#f5e6d8 50%,#e8d5c4 75%)", backgroundSize: "200% 100%", animation: "shimmer 1.4s infinite", ...style }} />
+  );
+}
+function PatternSkeleton() {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10, padding: "20px 0" }}>
+      <Skeleton width="40%" height={22} radius={10} style={{ marginBottom: 8 }} />
+      {Array.from({ length: 8 }, (_, i) => (
+        <div key={i} style={{ display: "grid", gridTemplateColumns: "90px 1fr 60px", gap: 12, padding: "10px 16px", background: "#fff8f4", border: "2px solid #e8d5c4", borderLeft: "6px solid #e8d5c4", borderRadius: 12 }}>
+          <Skeleton height={14} radius={6} />
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}><Skeleton height={13} radius={5} /><Skeleton width="70%" height={13} radius={5} /></div>
+          <Skeleton height={22} radius={50} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+
 function ToolsPage({ defaultTool }) {
   const [tool, setTool] = useState(defaultTool || "rewriter");
+  const [sharedPixelImg, setSharedPixelImg] = useState(null);
+  const tools = [
+    { id: "rewriter", label: "Pattern Rewriter", color: C.cherry },
+    { id: "scanner",  label: "Yarn Scanner",     color: C.royal  },
+    { id: "pixelart", label: "Pixel Art",         color: C.mauve  },
+    { id: "pixel",    label: "Pixel Grid",        color: C.caramel, textColor: C.choco },
+  ];
+  const banners = {
+    rewriter: { bg: C.cherry, text: <>Paste any pattern, enter your gauge, and get the <strong style={{ color: C.caramel }}>entire pattern rewritten for your exact yarn and hook</strong> — every row, every stitch count.</> },
+    scanner:  { bg: C.royal,  text: <>Upload a photo of your leftover yarn and get <strong style={{ color: C.caramel }}>4 project ideas matched to your colours and amount</strong> — with free patterns to start.</> },
+    pixelart: { bg: C.choco,  text: <><strong style={{ color: C.caramel }}>Convert any photo into flat-colour pixel art</strong> — choose block size and colour count, then send straight to the Pixel Grid tool for numbering.</> },
+    pixel:    { bg: C.choco,  text: <><strong style={{ color: C.caramel }}>Upload a pixel grid image and get serpentine numbers overlaid on every cell</strong> — auto-detects rows and columns, export as PNG.</> },
+  };
+  const b = banners[tool] || banners.rewriter;
+
+  const handleExportToGrid = (payload) => {
+    setSharedPixelImg(payload);
+    setTool("pixel");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
   return (
-    <div style={{ maxWidth: 820, margin: "0 auto", padding: "28px 18px 60px" }}>
-      {/* Tool switcher */}
-      <div style={{ display: "flex", gap: 12, marginBottom: 28, justifyContent: "center", flexWrap: "wrap" }}>
-        {[{ id: "rewriter", label: "Pattern Rewriter", color: C.cherry }, { id: "scanner", label: "Yarn Scanner", color: C.royal }].map(t => (
+    <div style={{ maxWidth: 900, margin: "0 auto", padding: "28px 18px 60px" }}>
+      <div style={{ display: "flex", gap: 10, marginBottom: 28, justifyContent: "center", flexWrap: "wrap" }}>
+        {tools.map(t => (
           <button key={t.id} onClick={() => setTool(t.id)} style={{
-            padding: "10px 24px", borderRadius: 50, border: `2.5px solid ${tool === t.id ? t.color : "#ccc"}`,
-            background: tool === t.id ? t.color : C.white, color: tool === t.id ? C.white : "#999",
-            fontFamily: DISPLAY, fontSize: 16, cursor: "pointer",
+            padding: "9px 20px", borderRadius: 50, border: `2.5px solid ${tool === t.id ? t.color : "#ccc"}`,
+            background: tool === t.id ? t.color : C.white,
+            color: tool === t.id ? (t.textColor || C.white) : "#999",
+            fontFamily: DISPLAY, fontSize: 15, cursor: "pointer",
             boxShadow: tool === t.id ? `4px 4px 0 ${C.black}` : "none",
             transition: "all 0.18s",
           }}>{t.label}</button>
         ))}
       </div>
-      {/* Banner */}
-      <div style={{ background: tool === "rewriter" ? C.cherry : C.royal, border: `2.5px solid ${C.black}`, borderRadius: 18, boxShadow: `4px 4px 0 ${C.black}`, padding: "13px 20px", marginBottom: 24 }}>
-        {tool === "rewriter"
-          ? <p style={{ margin: 0, fontSize: 14.5, color: C.white, lineHeight: 1.75, fontFamily: BODY }}>Ever found a tutorial you loved but your yarn is a different weight or size? Instead of spending a whole day doing the maths yourself, <strong style={{ color: C.caramel }}>paste the original pattern, tell me your yarn and hook, and I'll rewrite the entire pattern for you</strong> — every row, every stitch count, every design detail.</p>
-          : <p style={{ margin: 0, fontSize: 14.5, color: C.white, lineHeight: 1.75, fontFamily: BODY }}>Every crocheter has that stash of leftover yarn with nowhere to go. <strong style={{ color: C.caramel }}>Upload a photo of your leftover yarn and I'll estimate how much you have, suggest everything you could make with it</strong> — and find you free patterns to get started.</p>}
+      <div style={{ background: b.bg, border: `2.5px solid ${C.black}`, borderRadius: 18, boxShadow: `4px 4px 0 ${C.black}`, padding: "13px 20px", marginBottom: 24 }}>
+        <p style={{ margin: 0, fontSize: 14.5, color: C.white, lineHeight: 1.75, fontFamily: BODY }}>{b.text}</p>
       </div>
       <div key={tool} className="fadeUp">
-        {tool === "rewriter" ? <PatternRewriter /> : <YarnScanner />}
+        {tool === "rewriter" && <PatternRewriter />}
+        {tool === "scanner"  && <YarnScanner />}
+        {tool === "pixelart" && <PixelConverter onExportToGrid={handleExportToGrid} />}
+        {tool === "pixel"    && <PixelGridGenerator sharedImg={sharedPixelImg} onSharedImgUsed={() => setSharedPixelImg(null)} />}
       </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PIXEL CONVERTER
+// ══════════════════════════════════════════════════════════════════════════════
+function PixelConverter({ onExportToGrid }) {
+  const [imgData,   setImgData]   = useState(null);
+  const [pixelSize, setPixelSize] = useState(10);
+  const [numColors, setNumColors] = useState(6);
+  const [zoom,      setZoom]      = useState(1);
+  const [drag,      setDrag]      = useState(false);
+  const fRef        = useRef(null);
+  const canvasRef   = useRef(null);
+  const gridMetaRef = useRef(null); // exact block counts set after each render
+
+  const handleFile = (file) => {
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = (e) => setImgData(e.target.result);
+    reader.readAsDataURL(file);
+  };
+
+  // k-means++ initialization + clustering — proper spread prevents patchy snapping
+  const kMeans = (colorList, k, iterations = 20) => {
+    if (!colorList || colorList.length === 0) return [[0,0,0]];
+    k = Math.min(k, colorList.length);
+    // k-means++: pick first center randomly, then each next center biased toward farthest point
+    const centers = [colorList[Math.floor(colorList.length / 2)].slice()];
+    while (centers.length < k) {
+      const dists = colorList.map(([r,g,b]) => {
+        let minD = Infinity;
+        for (const [cr,cg,cb] of centers) {
+          const d = (r-cr)**2 + (g-cg)**2 + (b-cb)**2;
+          if (d < minD) minD = d;
+        }
+        return minD;
+      });
+      const total = dists.reduce((a,b) => a+b, 0);
+      let rand = Math.random() * total, chosen = 0;
+      for (let i = 0; i < dists.length; i++) { rand -= dists[i]; if (rand <= 0) { chosen = i; break; } }
+      centers.push(colorList[chosen].slice());
+    }
+    for (let iter = 0; iter < iterations; iter++) {
+      const sums   = Array.from({ length: k }, () => [0, 0, 0]);
+      const counts = new Array(k).fill(0);
+      for (const [r, g, b] of colorList) {
+        let best = 0, bestD = Infinity;
+        for (let ci = 0; ci < k; ci++) {
+          const [cr, cg, cb] = centers[ci];
+          const d = (r-cr)**2 + (g-cg)**2 + (b-cb)**2;
+          if (d < bestD) { bestD = d; best = ci; }
+        }
+        sums[best][0] += r; sums[best][1] += g; sums[best][2] += b; counts[best]++;
+      }
+      for (let ci = 0; ci < k; ci++) {
+        if (counts[ci] > 0) {
+          centers[ci] = [Math.round(sums[ci][0]/counts[ci]), Math.round(sums[ci][1]/counts[ci]), Math.round(sums[ci][2]/counts[ci])];
+        }
+      }
+    }
+    return centers;
+  };
+
+  const nearestCenter = (r, g, b, centers) => {
+    let best = 0, bestD = Infinity;
+    for (let ci = 0; ci < centers.length; ci++) {
+      const [cr, cg, cb] = centers[ci];
+      const d = (r-cr)**2 + (g-cg)**2 + (b-cb)**2;
+      if (d < bestD) { bestD = d; best = ci; }
+    }
+    return centers[best];
+  };
+
+  useEffect(() => {
+    if (!imgData) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const img = new Image();
+    img.onload = () => {
+      const maxDisplay = 800;
+      const scale  = maxDisplay / Math.max(img.naturalWidth, img.naturalHeight);
+      const displayW = Math.round(img.naturalWidth  * scale);
+      const displayH = Math.round(img.naturalHeight * scale);
+
+      const blocksW = Math.max(1, Math.round(displayW / pixelSize));
+      const blocksH = Math.max(1, Math.round(displayH / pixelSize));
+
+      // Step 1: draw full image at display size into offscreen canvas
+      const src = document.createElement("canvas");
+      src.width  = displayW;
+      src.height = displayH;
+      const sctx = src.getContext("2d");
+      sctx.imageSmoothingEnabled = true;
+      sctx.imageSmoothingQuality = "high";
+      sctx.drawImage(img, 0, 0, displayW, displayH);
+      const srcPx = sctx.getImageData(0, 0, displayW, displayH).data;
+
+      // Step 2: adaptive sampling per block
+      // Small blocks (≤15px): sample a 3x3 center grid — fast and accurate
+      // Large blocks (>15px): sample inner 60% of the block zone, pick the most frequent color
+      // Both approaches avoid edge pixels / grid lines that contaminate averages
+      const blockColors = new Array(blocksH * blocksW);
+      const bW = displayW / blocksW;
+      const bH = displayH / blocksH;
+      const isLarge = pixelSize > 15;
+
+      for (let r = 0; r < blocksH; r++) {
+        for (let c = 0; c < blocksW; c++) {
+          const x0 = c * bW, x1 = (c + 1) * bW;
+          const y0 = r * bH, y1 = (r + 1) * bH;
+
+          let samples = [];
+
+          if (!isLarge) {
+            // Small blocks: just sample 3×3 points centered in block
+            for (let sy = 0; sy < 3; sy++) {
+              for (let sx = 0; sx < 3; sx++) {
+                const px = Math.min(displayW - 1, Math.round(x0 + bW * (sx + 1) / 4));
+                const py = Math.min(displayH - 1, Math.round(y0 + bH * (sy + 1) / 4));
+                const i  = (py * displayW + px) * 4;
+                samples.push([srcPx[i], srcPx[i+1], srcPx[i+2]]);
+              }
+            }
+          } else {
+            // Large blocks: sample inner 60% zone on a regular grid (5×5 points)
+            const margin = 0.2; // skip outer 20% on each side
+            for (let sy = 0; sy < 5; sy++) {
+              for (let sx = 0; sx < 5; sx++) {
+                const fx = margin + (sx / 4) * (1 - 2 * margin);
+                const fy = margin + (sy / 4) * (1 - 2 * margin);
+                const px = Math.min(displayW - 1, Math.round(x0 + bW * fx));
+                const py = Math.min(displayH - 1, Math.round(y0 + bH * fy));
+                const i  = (py * displayW + px) * 4;
+                samples.push([srcPx[i], srcPx[i+1], srcPx[i+2]]);
+              }
+            }
+          }
+
+          // Pick most frequent color among samples (binned to nearest 32 to handle minor variation)
+          const freq = {};
+          let bestKey = null, bestCount = 0;
+          for (const [sr, sg, sb] of samples) {
+            const key = `${sr >> 5},${sg >> 5},${sb >> 5}`;
+            freq[key] = (freq[key] || { count: 0, r: sr, g: sg, b: sb });
+            freq[key].count++;
+            if (freq[key].count > bestCount) { bestCount = freq[key].count; bestKey = key; }
+          }
+          const best = freq[bestKey];
+          blockColors[r * blocksW + c] = [best.r, best.g, best.b];
+        }
+      }
+
+      // Step 3: k-means quantize — snap every block to one of N solid palette colors
+      const palette = kMeans(blockColors, Math.min(numColors, blocksW * blocksH));
+
+      // Step 4: layout — display block size uses zoom
+      const HEADER       = 28;
+      const BLOCK_SCREEN = Math.max(18, pixelSize) * zoom;
+      const blockW       = BLOCK_SCREEN;
+      const blockH       = BLOCK_SCREEN;
+      const dpr          = window.devicePixelRatio || 1;
+      const totalW       = HEADER + blocksW * blockW;
+      const totalH       = HEADER + blocksH * blockH;
+
+      // Store exact counts so exportToGrid can use them
+      gridMetaRef.current = { blocksW, blocksH, HEADER, blockW, blockH };
+
+      canvas.width  = totalW * dpr;
+      canvas.height = totalH * dpr;
+      canvas.style.width  = totalW + "px";
+      canvas.style.height = totalH + "px";
+
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+      ctx.imageSmoothingEnabled = false;
+
+      // Fill entire canvas white first — no transparent gaps ever show through
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, totalW, totalH);
+
+      // Step 5: draw each block as a 100% opaque solid color — no rgba, no blending
+      for (let r = 0; r < blocksH; r++) {
+        for (let c = 0; c < blocksW; c++) {
+          const [R, G, B] = nearestCenter(...blockColors[r * blocksW + c], palette);
+          ctx.fillStyle = `rgb(${R},${G},${B})`;
+          ctx.fillRect(HEADER + c * blockW, HEADER + r * blockH, blockW, blockH);
+        }
+      }
+
+      // Step 6: grid lines
+      ctx.strokeStyle = "rgba(0,0,0,0.25)";
+      ctx.lineWidth = 1;
+      for (let c = 0; c <= blocksW; c++) {
+        const x = HEADER + c * blockW;
+        ctx.beginPath(); ctx.moveTo(x, HEADER); ctx.lineTo(x, HEADER + blocksH * blockH); ctx.stroke();
+      }
+      for (let r = 0; r <= blocksH; r++) {
+        const y = HEADER + r * blockH;
+        ctx.beginPath(); ctx.moveTo(HEADER, y); ctx.lineTo(HEADER + blocksW * blockW, y); ctx.stroke();
+      }
+
+      // Step 7: column headers
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      const colFs = Math.max(7, Math.min(blockW * 0.55, HEADER - 4));
+      ctx.font = `bold ${colFs}px Arial, sans-serif`;
+      for (let c = 0; c < blocksW; c++) {
+        ctx.fillStyle = c % 2 === 0 ? "rgba(251,222,156,0.9)" : "rgba(251,222,156,0.55)";
+        ctx.fillRect(HEADER + c * blockW, 0, blockW, HEADER);
+        ctx.fillStyle = "#2A0A0E";
+        ctx.fillText(String(c + 1), HEADER + c * blockW + blockW / 2, HEADER / 2);
+      }
+
+      // Step 8: row headers
+      const rowFs = Math.max(7, Math.min(blockH * 0.55, HEADER - 4));
+      ctx.font = `bold ${rowFs}px Arial, sans-serif`;
+      for (let r = 0; r < blocksH; r++) {
+        ctx.fillStyle = r % 2 === 0 ? "rgba(234,157,174,0.9)" : "rgba(234,157,174,0.55)";
+        ctx.fillRect(0, HEADER + r * blockH, HEADER, blockH);
+        ctx.fillStyle = "#2A0A0E";
+        ctx.fillText(String(r + 1), HEADER / 2, HEADER + r * blockH + blockH / 2);
+      }
+
+      // Corner
+      ctx.fillStyle = "#45151B";
+      ctx.fillRect(0, 0, HEADER, HEADER);
+    };
+    img.src = imgData;
+  }, [imgData, pixelSize, numColors, zoom]);
+
+  const exportPNG = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const a = document.createElement("a");
+    a.download = `pixel-art-${pixelSize}px-${numColors}colors.png`;
+    a.href = canvas.toDataURL("image/png");
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  const exportToGrid = () => {
+    const canvas  = canvasRef.current;
+    const meta    = gridMetaRef.current;
+    if (!canvas || !meta || !onExportToGrid) return;
+    const { blocksW, blocksH, HEADER, blockW, blockH } = meta;
+    const dpr = window.devicePixelRatio || 1;
+
+    // Strip the header — create a clean canvas with ONLY the pixel art blocks
+    const clean = document.createElement("canvas");
+    clean.width  = blocksW * blockW * dpr;
+    clean.height = blocksH * blockH * dpr;
+    const cctx = clean.getContext("2d");
+    // Copy just the block area (skip the HEADER px of labels)
+    cctx.drawImage(
+      canvas,
+      HEADER * dpr, HEADER * dpr,                  // source x,y (skip header)
+      blocksW * blockW * dpr, blocksH * blockH * dpr, // source w,h
+      0, 0,                                          // dest x,y
+      blocksW * blockW * dpr, blocksH * blockH * dpr  // dest w,h
+    );
+    onExportToGrid({ dataUrl: clean.toDataURL("image/png"), blocksW, blocksH });
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 0 }}>
+      <style>{`
+        .pa-panel { background:#1a0a0e; border-radius:24px; border:2.5px solid #45151B; box-shadow:6px 6px 0 #45151B; overflow:hidden; }
+        .pa-slider { -webkit-appearance:none; appearance:none; width:100%; height:6px; border-radius:3px; outline:none; cursor:pointer; }
+        .pa-slider::-webkit-slider-thumb { -webkit-appearance:none; width:20px; height:20px; border-radius:50%; border:2.5px solid #1a0a0e; cursor:pointer; }
+        .pa-tool-btn { border:2px solid #45151B; border-radius:12px; cursor:pointer; font-family:'Fredoka One',cursive; font-size:13px; padding:8px 16px; transition:all 0.15s; }
+        .pa-tool-btn:hover { transform:translate(-2px,-2px); box-shadow:4px 4px 0 #45151B; }
+        .pa-drop { border:2.5px dashed rgba(255,255,255,0.2); border-radius:16px; cursor:pointer; transition:all 0.2s; }
+        .pa-drop:hover { border-color:rgba(255,255,255,0.5); background:rgba(255,255,255,0.05); }
+      `}</style>
+
+      {/* ── HEADER BAR ── */}
+      <div style={{ background:"#1a0a0e", borderRadius:"24px 24px 0 0", border:"2.5px solid #45151B", borderBottom:"none", padding:"18px 28px", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:12 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:14 }}>
+          <div style={{ width:44, height:44, borderRadius:12, background:`linear-gradient(135deg,${C.royal},${C.mauve})`, border:"2px solid rgba(255,255,255,0.2)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:22 }}>🖼️</div>
+          <div>
+            <h2 style={{ margin:0, fontFamily:DISPLAY, fontSize:22, color:C.white, lineHeight:1 }}>Pixel Art Converter</h2>
+            <p style={{ margin:"3px 0 0", fontFamily:BODY, fontSize:12, color:"rgba(255,255,255,0.5)" }}>Convert any photo into a flat-colour pixel grid</p>
+          </div>
+        </div>
+        {imgData && (
+          <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+            <div style={{ display:"flex", border:"2px solid rgba(255,255,255,0.2)", borderRadius:50, overflow:"hidden" }}>
+              <button onClick={() => setZoom(z => Math.max(0.5, +(z-0.25).toFixed(2)))} style={{ padding:"6px 13px", background:"rgba(255,255,255,0.08)", border:"none", cursor:"pointer", color:C.white, fontSize:16, borderRight:"1px solid rgba(255,255,255,0.15)" }}>−</button>
+              <span style={{ padding:"6px 12px", background:"rgba(255,255,255,0.05)", fontFamily:DISPLAY, fontSize:13, color:C.caramel, minWidth:52, textAlign:"center" }}>{Math.round(zoom*100)}%</span>
+              <button onClick={() => setZoom(z => Math.min(4, +(z+0.25).toFixed(2)))} style={{ padding:"6px 13px", background:"rgba(255,255,255,0.08)", border:"none", cursor:"pointer", color:C.white, fontSize:16, borderLeft:"1px solid rgba(255,255,255,0.15)" }}>+</button>
+            </div>
+            <button onClick={exportPNG} className="pa-tool-btn" style={{ background:C.caramel, color:C.choco }}>⬇ Export PNG</button>
+            <button onClick={exportToGrid} className="pa-tool-btn" style={{ background:C.mauve, color:C.choco }}>🧩 → Pixel Grid</button>
+          </div>
+        )}
+      </div>
+
+      {/* ── BODY ── */}
+      <div style={{ display:"grid", gridTemplateColumns:"300px 1fr", background:"#1a0a0e", border:"2.5px solid #45151B", borderTop:"none", borderRadius:"0 0 24px 24px", boxShadow:"6px 6px 0 #45151B", minHeight:520 }}>
+
+        {/* LEFT PANEL — controls */}
+        <div style={{ borderRight:"1.5px solid rgba(255,255,255,0.08)", padding:"22px 20px", display:"flex", flexDirection:"column", gap:20 }}>
+
+          {/* Drop zone */}
+          <div className="pa-drop" onClick={() => fRef.current?.click()}
+            onDragOver={e => { e.preventDefault(); setDrag(true); }}
+            onDragLeave={() => setDrag(false)}
+            onDrop={e => { e.preventDefault(); setDrag(false); handleFile(e.dataTransfer.files[0]); }}
+            style={{ background: drag ? "rgba(255,255,255,0.08)" : imgData ? "transparent" : "rgba(255,255,255,0.03)", padding: imgData ? 0 : "28px 16px", textAlign:"center", overflow:"hidden" }}>
+            <input ref={fRef} type="file" accept="image/*" style={{ display:"none" }} onChange={e => { if (e.target.files[0]) { handleFile(e.target.files[0]); e.target.value=""; } }} />
+            {imgData ? (
+              <div>
+                <img src={imgData} alt="preview" style={{ width:"100%", maxHeight:140, objectFit:"contain", display:"block" }} />
+                <button onClick={e => { e.stopPropagation(); fRef.current?.click(); }}
+                  style={{ width:"100%", padding:"7px", background:"rgba(255,255,255,0.06)", border:"none", cursor:"pointer", fontFamily:BODY, fontSize:12, color:"rgba(255,255,255,0.5)" }}>
+                  ↻ Change image
+                </button>
+              </div>
+            ) : (
+              <>
+                <div style={{ fontSize:32, marginBottom:8 }}>🖼️</div>
+                <p style={{ margin:"0 0 3px", fontFamily:DISPLAY, fontSize:15, color:"rgba(255,255,255,0.7)" }}>Drop image here</p>
+                <p style={{ margin:0, fontSize:11, color:"rgba(255,255,255,0.35)", fontFamily:BODY }}>jpg · png · webp</p>
+              </>
+            )}
+          </div>
+
+          {/* Block size */}
+          <div>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+              <span style={{ fontFamily:DISPLAY, fontSize:13, color:"rgba(255,255,255,0.6)", letterSpacing:"0.05em", textTransform:"uppercase" }}>Block Size</span>
+              <span style={{ fontFamily:DISPLAY, fontSize:20, color:C.caramel }}>{pixelSize}<span style={{ fontSize:12, opacity:0.6 }}>px</span></span>
+            </div>
+            <input type="range" min={1} max={25} step={1} value={pixelSize} onChange={e => setPixelSize(Number(e.target.value))}
+              className="pa-slider"
+              style={{ background:`linear-gradient(to right,${C.royal} ${(pixelSize-1)/24*100}%,rgba(255,255,255,0.12) ${(pixelSize-1)/24*100}%)` }} />
+            <div style={{ display:"flex", justifyContent:"space-between", marginTop:5 }}>
+              <span style={{ fontSize:10, color:"rgba(255,255,255,0.3)", fontFamily:BODY }}>fine detail</span>
+              <span style={{ fontSize:10, color:"rgba(255,255,255,0.3)", fontFamily:BODY }}>chunky</span>
+            </div>
+            <style>{`.pa-slider::-webkit-slider-thumb { background:${C.caramel}; }`}</style>
+          </div>
+
+          {/* Colours */}
+          <div>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:10 }}>
+              <span style={{ fontFamily:DISPLAY, fontSize:13, color:"rgba(255,255,255,0.6)", letterSpacing:"0.05em", textTransform:"uppercase" }}>Colours</span>
+              <span style={{ fontFamily:DISPLAY, fontSize:20, color:C.mauve }}>{numColors}</span>
+            </div>
+            <input type="range" min={2} max={16} step={1} value={numColors} onChange={e => setNumColors(Number(e.target.value))}
+              className="pa-slider"
+              style={{ background:`linear-gradient(to right,${C.mauve} ${(numColors-2)/14*100}%,rgba(255,255,255,0.12) ${(numColors-2)/14*100}%)` }} />
+            <div style={{ display:"flex", justifyContent:"space-between", marginTop:5 }}>
+              <span style={{ fontSize:10, color:"rgba(255,255,255,0.3)", fontFamily:BODY }}>2 colours</span>
+              <span style={{ fontSize:10, color:"rgba(255,255,255,0.3)", fontFamily:BODY }}>16 colours</span>
+            </div>
+          </div>
+
+          {imgData && (
+            <div style={{ marginTop:"auto", padding:"12px 14px", background:"rgba(255,255,255,0.04)", borderRadius:12, border:"1px solid rgba(255,255,255,0.08)" }}>
+              <p style={{ margin:0, fontFamily:BODY, fontSize:12, color:"rgba(255,255,255,0.45)", lineHeight:1.6 }}>
+                Adjust block size + colours then hit <strong style={{ color:C.caramel }}>Export PNG</strong> or send directly to <strong style={{ color:C.mauve }}>Pixel Grid</strong> for numbering.
+              </p>
+            </div>
+          )}
+        </div>
+
+        {/* RIGHT PANEL — canvas */}
+        <div style={{ overflow:"auto", display:"flex", alignItems:imgData?"flex-start":"center", justifyContent:"center", padding:16, minHeight:520, background:"#111" }}>
+          {imgData ? (
+            <canvas ref={canvasRef} style={{ display:"block", borderRadius:6 }} />
+          ) : (
+            <div style={{ textAlign:"center", opacity:0.25 }}>
+              <div style={{ fontSize:64, marginBottom:12 }}>🎨</div>
+              <p style={{ fontFamily:DISPLAY, fontSize:16, color:C.white }}>Preview appears here</p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+function generateSerpentine(rows, cols, reversed = false) {
+  const grid = [];
+  for (let r = 0; r < rows; r++) {
+    const ltr = reversed ? r % 2 !== 0 : r % 2 === 0;
+    const row = ltr
+      ? Array.from({ length: cols }, (_, c) => c + 1)
+      : Array.from({ length: cols }, (_, c) => cols - c);
+    grid.push(row);
+  }
+  return grid;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PIXEL GRID GENERATOR
+// ══════════════════════════════════════════════════════════════════════════════
+function PixelGridGenerator({ sharedImg, onSharedImgUsed }) {
+  const [imgData,   setImgData]   = useState(null);
+  const [rows,      setRows]      = useState("");
+  const [cols,      setCols]      = useState("");
+  const [reversed,  setReversed]  = useState(false);
+  const [zoom,      setZoom]      = useState(1);
+  const [detecting, setDetecting] = useState(false);
+  const [autoMsg,   setAutoMsg]   = useState("");
+  const [drag,      setDrag]      = useState(false);
+  const [linesFracX, setLinesFracX] = useState(null);
+  const [linesFracY, setLinesFracY] = useState(null);
+  const fRef      = useRef(null);
+  const canvasRef = useRef(null);
+
+  // Auto-load image sent from Pixel Art tool
+  useEffect(() => {
+    if (!sharedImg) return;
+    // sharedImg is either a plain dataUrl (old path) or { dataUrl, blocksW, blocksH }
+    const isObj   = typeof sharedImg === "object";
+    const dataUrl = isObj ? sharedImg.dataUrl : sharedImg;
+    setImgData(dataUrl);
+    setAutoMsg("");
+    setLinesFracX(null);
+    setLinesFracY(null);
+    if (isObj && sharedImg.blocksW && sharedImg.blocksH) {
+      // Exact counts from pixel art — no detection needed, perfect alignment guaranteed
+      setCols(String(sharedImg.blocksW));
+      setRows(String(sharedImg.blocksH));
+      setAutoMsg(`✅ ${sharedImg.blocksW} columns × ${sharedImg.blocksH} rows from Pixel Art`);
+      setDetecting(false);
+    } else {
+      setRows(""); setCols("");
+      autoDetect(dataUrl);
+    }
+    if (onSharedImgUsed) onSharedImgUsed();
+  }, [sharedImg]);
+
+  const numRows = Math.max(1, Math.min(500, Number(rows) || 1));
+  const numCols = Math.max(1, Math.min(500, Number(cols) || 1));
+
+  // ── Auto-detect: autocorrelation finds the TRUE cell period ─────────────────
+  const autoDetect = (dataUrl) => {
+    setDetecting(true);
+    setAutoMsg("Scanning image for grid lines…");
+    const img = new Image();
+    img.onload = () => {
+      const W = img.naturalWidth;
+      const H = img.naturalHeight;
+      const off = document.createElement("canvas");
+      off.width = W; off.height = H;
+      const ctx = off.getContext("2d");
+      ctx.drawImage(img, 0, 0);
+      const px = ctx.getImageData(0, 0, W, H).data;
+
+      // Average brightness per column and row
+      const colVal = Array.from({ length: W }, (_, x) => {
+        let s = 0, n = 0;
+        const step = Math.max(1, Math.floor(H / 100));
+        for (let y = 0; y < H; y += step) { const i=(y*W+x)*4; s+=(px[i]+px[i+1]+px[i+2])/3; n++; }
+        return s / n;
+      });
+      const rowVal = Array.from({ length: H }, (_, y) => {
+        let s = 0, n = 0;
+        const step = Math.max(1, Math.floor(W / 100));
+        for (let x = 0; x < W; x += step) { const i=(y*W+x)*4; s+=(px[i]+px[i+1]+px[i+2])/3; n++; }
+        return s / n;
+      });
+
+      // Normalised autocorrelation — finds the dominant PERIOD of the signal
+      // This works regardless of grid color (dark lines, light lines, any pattern)
+      const findPeriod = (signal, size) => {
+        const mean = signal.reduce((a,b)=>a+b,0)/signal.length;
+        const c    = signal.map(v => v - mean);
+        const var0 = c.reduce((a,v)=>a+v*v,0);
+        if (var0 < 1) return null;
+
+        let bestLag = 0, bestCorr = -Infinity;
+        const maxLag = Math.floor(size / 2);
+        for (let lag = 3; lag <= maxLag; lag++) {
+          let corr = 0;
+          for (let i = 0; i < signal.length - lag; i++) corr += c[i] * c[i+lag];
+          corr /= var0;
+          if (corr > bestCorr) { bestCorr = corr; bestLag = lag; }
+        }
+        // Must be meaningfully periodic — correlation above 0.15
+        return bestCorr > 0.15 ? Math.max(2, Math.round(size / Math.round(size / bestLag))) : null;
+      };
+
+      const detectedCols = findPeriod(colVal, W);
+      const detectedRows = findPeriod(rowVal, H);
+
+      if (detectedCols && detectedRows) {
+        setCols(String(detectedCols));
+        setRows(String(detectedRows));
+        setAutoMsg(`✅ Detected ${detectedCols} columns × ${detectedRows} rows`);
+      } else {
+        setCols(""); setRows("");
+        setAutoMsg("⚠️ Could not detect grid — enter rows and columns manually");
+      }
+      setDetecting(false);
+    };
+    img.onerror = () => { setAutoMsg("Could not scan image"); setDetecting(false); };
+    img.src = dataUrl;
+  };
+
+  const handleFile = (file) => {
+    if (!file || !file.type.startsWith("image/")) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const dataUrl = e.target.result;
+      setImgData(dataUrl);
+      setRows(""); setCols(""); setAutoMsg(""); setLinesFracX(null); setLinesFracY(null);
+      autoDetect(dataUrl);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // ── Canvas: image untouched, clean even grid overlay ─────────────────────
+  useEffect(() => {
+    if (!imgData || !rows || !cols || detecting) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const img = new Image();
+    img.onload = () => {
+      const naturalW = img.naturalWidth;
+      const naturalH = img.naturalHeight;
+      const baseScale = Math.min(1, 900 / Math.max(naturalW, naturalH));
+      const displayW  = Math.round(naturalW * baseScale * zoom);
+      const displayH  = Math.round(naturalH * baseScale * zoom);
+      const LABEL_W   = 36;
+      const dpr       = window.devicePixelRatio || 1;
+
+      canvas.width  = (displayW + LABEL_W) * dpr;
+      canvas.height = displayH * dpr;
+      canvas.style.width  = (displayW + LABEL_W) + "px";
+      canvas.style.height = displayH + "px";
+
+      const ctx = canvas.getContext("2d");
+      ctx.scale(dpr, dpr);
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+
+      // 1. Draw image — never distorted
+      ctx.drawImage(img, 0, 0, displayW, displayH);
+
+      // 2. Always even spacing
+      const cellW = displayW / numCols;
+      const cellH = displayH / numRows;
+
+      // 3. Grid lines — draw twice: white then black so they're visible on ANY background
+      ctx.lineWidth = 1;
+      for (let c = 0; c <= numCols; c++) {
+        const x = Math.round(c * cellW) + 0.5;
+        ctx.strokeStyle = "rgba(255,255,255,0.55)";
+        ctx.beginPath(); ctx.moveTo(x - 0.5, 0); ctx.lineTo(x - 0.5, displayH); ctx.stroke();
+        ctx.strokeStyle = "rgba(0,0,0,0.45)";
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, displayH); ctx.stroke();
+      }
+      for (let r = 0; r <= numRows; r++) {
+        const y = Math.round(r * cellH) + 0.5;
+        ctx.strokeStyle = "rgba(255,255,255,0.55)";
+        ctx.beginPath(); ctx.moveTo(0, y - 0.5); ctx.lineTo(displayW, y - 0.5); ctx.stroke();
+        ctx.strokeStyle = "rgba(0,0,0,0.45)";
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(displayW, y); ctx.stroke();
+      }
+
+      // 4. Serpentine numbers — visible at any cell size
+      const grid = generateSerpentine(numRows, numCols, reversed);
+      const fs   = Math.max(9, Math.min(cellW * 0.55, cellH * 0.55, 20));
+
+      if (cellW >= 8 && cellH >= 8) {
+        ctx.save();
+        ctx.textAlign    = "center";
+        ctx.textBaseline = "middle";
+        ctx.font         = `bold ${fs}px Arial, sans-serif`;
+        ctx.lineJoin     = "round";
+        ctx.lineWidth    = Math.max(2, fs * 0.22);
+        for (let r = 0; r < numRows; r++) {
+          for (let c = 0; c < numCols; c++) {
+            const cx  = Math.round(c * cellW) + cellW / 2;
+            const cy  = Math.round(r * cellH) + cellH / 2;
+            const num = String(grid[r][c]);
+            ctx.strokeStyle = "rgba(0,0,0,0.95)";
+            ctx.strokeText(num, cx, cy);
+            ctx.fillStyle = "#ffffff";
+            ctx.fillText(num, cx, cy);
+          }
+        }
+        ctx.restore();
+      }
+
+      // 5. Direction strip: caramel = L→R, mauve = R←L
+      for (let r = 0; r < numRows; r++) {
+        const ltr = reversed ? r % 2 !== 0 : r % 2 === 0;
+        const y   = Math.round(r * cellH);
+        const h   = Math.round(cellH);
+        ctx.fillStyle = ltr ? "rgba(251,222,156,0.95)" : "rgba(234,157,174,0.95)";
+        ctx.fillRect(displayW, y, LABEL_W, h);
+        ctx.strokeStyle = "rgba(69,21,27,0.3)";
+        ctx.lineWidth = 0.5;
+        ctx.strokeRect(displayW, y, LABEL_W, h);
+        const lfs = Math.max(9, Math.min(h - 2, 16));
+        ctx.font = `bold ${lfs}px Arial, sans-serif`;
+        ctx.lineWidth = 1.5;
+        ctx.strokeStyle = "rgba(0,0,0,0.3)";
+        ctx.strokeText(ltr ? "→" : "←", displayW + LABEL_W / 2, y + h / 2);
+        ctx.fillStyle = "#45151B";
+        ctx.fillText(ltr ? "→" : "←", displayW + LABEL_W / 2, y + h / 2);
+      }
+    };
+    img.src = imgData;
+  }, [imgData, numRows, numCols, zoom, reversed, detecting]);
+
+  const exportPNG = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const a = document.createElement("a");
+    a.download = `pixel-grid-${numRows}x${numCols}.png`;
+    a.href = canvas.toDataURL("image/png");
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+
+      {/* ── UPLOAD + SETTINGS ── */}
+      <div style={{ ...card, padding: "28px 30px" }}>
+        <div style={{ background: C.mauve, padding: "10px 22px", margin: "-28px -30px 22px", borderBottom: `2.5px solid ${C.black}`, borderRadius: "22px 22px 0 0" }}>
+          <h2 style={{ margin: 0, color: C.choco, fontFamily: DISPLAY, fontSize: 20 }}>🎨 Pixel Grid Generator</h2>
+        </div>
+
+        <p style={{ margin: "0 0 16px", fontSize: 14.5, color: C.black, lineHeight: 1.7, fontFamily: BODY }}>
+          Upload your pixel grid image — rows and columns are <strong>auto-detected from the grid lines</strong>. Numbers are then overlaid in serpentine order automatically.
+        </p>
+
+        {/* Drop zone */}
+        <div
+          onClick={() => fRef.current?.click()}
+          onDragOver={e => { e.preventDefault(); setDrag(true); }}
+          onDragLeave={() => setDrag(false)}
+          onDrop={e => { e.preventDefault(); setDrag(false); handleFile(e.dataTransfer.files[0]); }}
+          style={{ border: `2.5px dashed ${drag ? C.mauve : imgData ? C.mauve : C.black}`, borderRadius: 18, cursor: "pointer", overflow: "hidden", marginBottom: 16, background: drag ? C.mauve+"18" : imgData ? C.mauve+"0C" : gridBg(C.cream), padding: imgData ? 0 : "40px 24px", textAlign: "center", boxShadow: `3px 3px 0 ${drag ? C.mauve : C.black}`, transition: "all 0.2s" }}>
+          <input ref={fRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { if (e.target.files[0]) { handleFile(e.target.files[0]); e.target.value = ""; } }} />
+          {imgData ? (
+            <div>
+              <img src={imgData} alt="preview" style={{ width: "100%", maxHeight: 200, objectFit: "contain", display: "block" }} />
+              <div style={{ padding: "8px 16px", background: detecting ? C.caramel+"88" : C.mauve+"33", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <span style={{ fontFamily: BODY, fontSize: 13, color: C.choco, fontWeight: 700 }}>
+                  {detecting ? "🔍 Scanning for grid lines…" : autoMsg || "✅ Image loaded"}
+                </span>
+                <button onClick={e => { e.stopPropagation(); fRef.current?.click(); }} style={{ ...btn(C.white), padding: "4px 12px", fontSize: 12, flexShrink: 0 }}>Change</button>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 44, marginBottom: 10 }}>🖼️</div>
+              <p style={{ margin: "0 0 4px", fontSize: 18, fontFamily: DISPLAY, color: C.choco }}>Drop your pixel grid image here</p>
+              <p style={{ margin: 0, fontSize: 13, color: "#999", fontFamily: BODY }}>Grid lines are detected automatically — jpg or png</p>
+            </>
+          )}
+        </div>
+
+        {/* Auto-detected values — editable if wrong */}
+        <div style={{ marginBottom: 16, padding: "14px 16px", background: C.caramel+"44", border: `1.5px dashed ${C.black}`, borderRadius: 14 }}>
+          <p style={{ margin: "0 0 10px", fontFamily: DISPLAY, fontSize: 14, color: C.choco }}>
+            Grid size — auto-detected, edit if needed
+          </p>
+          <div className="two-col" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              <Lbl>Rows</Lbl>
+              <Inp value={rows} onChange={setRows} placeholder="auto-detecting…" type="number" />
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              <Lbl>Columns</Lbl>
+              <Inp value={cols} onChange={setCols} placeholder="auto-detecting…" type="number" />
+            </div>
+          </div>
+          {rows && cols && !detecting && (
+            <p style={{ margin: "10px 0 0", fontFamily: BODY, fontSize: 12, color: C.choco }}>
+              {numRows} × {numCols} = {numRows * numCols} stitches total
+            </p>
+          )}
+        </div>
+
+        {/* Zoom */}
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+          <Lbl>Zoom</Lbl>
+          <div style={{ display: "flex", border: `2px solid ${C.black}`, borderRadius: 50, overflow: "hidden", boxShadow: `3px 3px 0 ${C.black}` }}>
+            <button onClick={() => setZoom(z => Math.max(0.2, +(z-0.1).toFixed(1)))} style={{ padding: "5px 14px", background: C.white, border: "none", cursor: "pointer", fontFamily: DISPLAY, fontSize: 16, borderRight: `1px solid ${C.black}` }}>−</button>
+            <span style={{ padding: "5px 12px", background: C.caramel, fontFamily: DISPLAY, fontSize: 13 }}>{Math.round(zoom*100)}%</span>
+            <button onClick={() => setZoom(z => Math.min(5, +(z+0.1).toFixed(1)))} style={{ padding: "5px 14px", background: C.white, border: "none", cursor: "pointer", fontFamily: DISPLAY, fontSize: 16, borderLeft: `1px solid ${C.black}` }}>+</button>
+          </div>
+        </div>
+
+        {/* Reverse direction toggle */}
+        <div onClick={() => setReversed(r => !r)}
+          style={{ display: "inline-flex", alignItems: "center", gap: 10, padding: "10px 16px", borderRadius: 14, border: `2px solid ${reversed ? C.mauve : C.black}`, background: reversed ? C.mauve+"22" : C.white, cursor: "pointer", boxShadow: `2px 2px 0 ${reversed ? C.mauve : C.black}`, userSelect: "none" }}>
+          <div style={{ width: 38, height: 22, borderRadius: 11, background: reversed ? C.mauve : "#ccc", border: `2px solid ${C.black}`, position: "relative", flexShrink: 0 }}>
+            <div style={{ position: "absolute", top: 2, left: reversed ? 16 : 2, width: 14, height: 14, borderRadius: "50%", background: C.white, border: `1.5px solid ${C.black}`, transition: "left 0.2s" }} />
+          </div>
+          <div>
+            <p style={{ margin: 0, fontFamily: DISPLAY, fontSize: 14, color: C.choco }}>Reverse Direction</p>
+            <p style={{ margin: 0, fontFamily: BODY, fontSize: 11, color: "#888" }}>Row 1 starts right → left</p>
+          </div>
+        </div>
+      </div>
+
+      {/* ── CANVAS OUTPUT ── */}
+      {imgData && rows && cols && !detecting && (
+        <div style={{ ...card, padding: "28px 30px" }} className="fadeUp">
+          <div style={{ background: C.mauve, padding: "10px 22px", margin: "-28px -30px 18px", borderBottom: `2.5px solid ${C.black}`, borderRadius: "22px 22px 0 0", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
+            <h2 style={{ margin: 0, color: C.choco, fontFamily: DISPLAY, fontSize: 18 }}>
+              {numRows} × {numCols} grid · {numRows * numCols} stitches
+            </h2>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <span style={{ padding: "4px 12px", background: C.caramel + "88", border: `1.5px dashed ${C.black}`, borderRadius: 8, fontFamily: BODY, fontSize: 12, color: C.choco }}>
+                🟨 Caramel = left→right
+              </span>
+              <span style={{ padding: "4px 12px", background: C.mauve + "44", border: `1.5px dashed ${C.mauve}`, borderRadius: 8, fontFamily: BODY, fontSize: 12, color: C.choco }}>
+                🌸 Mauve = right←left
+              </span>
+              <button onClick={exportPNG}
+                style={{ ...btn(C.choco, C.caramel), padding: "5px 14px", fontSize: 13, display: "flex", alignItems: "center", gap: 6 }}
+                onMouseEnter={e => { e.currentTarget.style.transform = "translate(-2px,-2px)"; e.currentTarget.style.boxShadow = `5px 5px 0 ${C.black}`; }}
+                onMouseLeave={e => { e.currentTarget.style.transform = "none"; e.currentTarget.style.boxShadow = `4px 4px 0 ${C.black}`; }}>
+                ⬇️ Export PNG
+              </button>
+            </div>
+          </div>
+
+          <div style={{ overflowX: "auto", overflowY: "auto", maxHeight: "82vh", border: `2px solid ${C.black}`, borderRadius: 10, background: "#111" }}>
+            <canvas
+              ref={canvasRef}
+              style={{ display: "block" }}
+            />
+          </div>
+
+          <p style={{ margin: "10px 0 0", fontSize: 12, color: "#999", fontFamily: BODY, textAlign: "center" }}>
+            Numbers follow serpentine order · if alignment is off, adjust rows/cols above · use Export PNG to save
+          </p>
+        </div>
+      )}
     </div>
   );
 }
@@ -933,6 +1603,8 @@ const NAV_LINKS = [
   { id: "home",     label: "Home" },
   { id: "rewriter", label: "Pattern Rewriter" },
   { id: "scanner",  label: "Yarn Scanner" },
+  { id: "pixelart", label: "Pixel Art" },
+  { id: "pixel",    label: "Pixel Grid" },
   { id: "about",    label: "About" },
   { id: "contact",  label: "Contact" },
 ];
@@ -943,7 +1615,7 @@ export default function App() {
 
   const goTo = (p) => { setPage(p); setMobileOpen(false); window.scrollTo({ top: 0, behavior: "smooth" }); };
 
-  const isToolPage = page === "rewriter" || page === "scanner";
+  const isToolPage = page === "rewriter" || page === "scanner" || page === "pixelart" || page === "pixel";
 
   return (
     <div style={{ minHeight: "100vh", fontFamily: BODY, background: "#FFF0E0" }}>
@@ -953,6 +1625,7 @@ export default function App() {
         @keyframes fadeUp { from { opacity:0;transform:translateY(18px); } to { opacity:1;transform:translateY(0); } }
         @keyframes dot    { 0%,80%,100%{transform:scale(0.6);opacity:0.4} 40%{transform:scale(1);opacity:1} }
         @keyframes wiggle { 0%,100%{transform:rotate(-3deg)} 50%{transform:rotate(3deg)} }
+        @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
         * { box-sizing: border-box; }
         input::placeholder, textarea::placeholder { color: #c9a898; font-family: 'Nunito', sans-serif; }
         .fadeUp { animation: fadeUp 0.38s cubic-bezier(0.16,1,0.3,1) both; }
